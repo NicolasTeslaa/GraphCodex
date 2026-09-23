@@ -1,0 +1,26 @@
+name: GraphCodex
+options:
+  bundleIdPrefix: dev.graphcodex
+  deploymentTarget:
+    macOS: "14.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    PRODUCT_BUNDLE_IDENTIFIER: dev.graphcodex.app
+    PRODUCT_NAME: GraphCodex
+    INFOPLIST_KEY_CFBundleDisplayName: GraphCodex
+    INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.developer-tools
+    GENERATE_INFOPLIST_FILE: YES
+    CODE_SIGN_STYLE: Automatic
+    MACOSX_DEPLOYMENT_TARGET: "14.0"
+targets:
+  GraphCodex:
+    type: application
+    platform: macOS
+    sources:
+      - path: Sources/GraphCodex
+      - path: Sources/GraphCodex/Assets.xcassets
+    settings:
+      base:
+        INFOPLIST_KEY_NSHighResolutionCapable: YES

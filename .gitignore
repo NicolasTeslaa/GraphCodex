@@ -1,0 +1,4 @@
+.build/
+GraphCodex.xcodeproj/
+*.xcuserstate
+xcuserdata/
