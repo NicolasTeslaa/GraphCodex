@@ -61,9 +61,14 @@ private struct AvatarStyle {
 /// Isometric, interactive office map. SceneKit keeps the room and the agents animated
 /// while their identity and state continue to come from the local Codex monitor.
 struct Office3DView: NSViewRepresentable {
-    let sessions: [CodexSession]
+    let groups: [ProjectGroup]
     let selectedSessionID: String?
+    let selectedProjectID: String?
+    let cameraMode: CameraMode
+    let reduceMotion: Bool
     let onSelect: (CodexSession) -> Void
+    let onOpen: (CodexSession) -> Void
+    let onSelectProject: (Project) -> Void
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
@@ -75,7 +80,7 @@ struct Office3DView: NSViewRepresentable {
         // Camera framing is local to the player; SceneKit's automatic controller frames
         // the whole room and would pull the view away from the avatar.
         view.allowsCameraControl = false
-        view.isPlaying = true
+        view.isPlaying = OfficeMotionPolicy.runsContinuousAnimations(reduceMotion: reduceMotion)
         view.preferredFramesPerSecond = 30
         view.rendersContinuously = true
         view.onZoom = { [weak coordinator = context.coordinator] amount in coordinator?.zoomCamera(by: amount) }
@@ -83,17 +88,26 @@ struct Office3DView: NSViewRepresentable {
             coordinator?.orbitCamera(deltaX: deltaX, deltaY: deltaY)
         }
         view.onToggleCamera = { [weak coordinator = context.coordinator] in coordinator?.toggleCameraMode() }
+        view.onCameraMode = { [weak coordinator = context.coordinator] mode in coordinator?.setCameraMode(mode) }
 
-        let click = NSClickGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.didClick(_:)))
-        click.numberOfClicksRequired = 1
-        view.addGestureRecognizer(click)
+        let singleClick = NSClickGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.didClick(_:)))
+        singleClick.numberOfClicksRequired = 1
+        let doubleClick = NSClickGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.didDoubleClick(_:)))
+        doubleClick.numberOfClicksRequired = 2
+        view.addGestureRecognizer(singleClick)
+        view.addGestureRecognizer(doubleClick)
 
         context.coordinator.view = view
         context.coordinator.onSelect = onSelect
+        context.coordinator.onOpen = onOpen
+        context.coordinator.onSelectProject = onSelectProject
+        context.coordinator.reduceMotion = reduceMotion
         view.onMovementKey = { [weak coordinator = context.coordinator] keyCode, isPressed in
             coordinator?.setMovementKey(keyCode, isPressed: isPressed)
         }
-        context.coordinator.synchronize(sessions, selectedID: selectedSessionID)
+        context.coordinator.synchronize(groups, selectedID: selectedSessionID, selectedProjectID: selectedProjectID)
+        context.coordinator.setCameraMode(cameraMode, animated: false)
+        view.scene?.rootNode.isPaused = reduceMotion
         view.onLayout = { [weak coordinator = context.coordinator] in coordinator?.updateCameraFraming() }
         return view
     }
@@ -101,13 +115,23 @@ struct Office3DView: NSViewRepresentable {
     func updateNSView(_ view: OfficeSceneView, context: Context) {
         context.coordinator.view = view
         context.coordinator.onSelect = onSelect
-        context.coordinator.synchronize(sessions, selectedID: selectedSessionID)
+        context.coordinator.onOpen = onOpen
+        context.coordinator.onSelectProject = onSelectProject
+        context.coordinator.reduceMotion = reduceMotion
+        view.isPlaying = OfficeMotionPolicy.runsContinuousAnimations(reduceMotion: reduceMotion)
+        view.scene?.rootNode.isPaused = reduceMotion
+        context.coordinator.synchronize(groups, selectedID: selectedSessionID, selectedProjectID: selectedProjectID)
+        view.scene?.rootNode.isPaused = reduceMotion
+        if context.coordinator.cameraMode != cameraMode { context.coordinator.setCameraMode(cameraMode) }
         context.coordinator.updateCameraFraming()
     }
 
     final class Coordinator: NSObject {
         weak var view: OfficeSceneView?
         var onSelect: ((CodexSession) -> Void)?
+        var onOpen: ((CodexSession) -> Void)?
+        var onSelectProject: ((Project) -> Void)?
+        private var latestGroups: [String: ProjectGroup] = [:]
         private var latestSessions: [String: CodexSession] = [:]
         private var sessionRoots: [String: SCNNode] = [:]
         private var selectionRings: [String: SCNNode] = [:]
@@ -116,16 +140,22 @@ struct Office3DView: NSViewRepresentable {
         private var boardContentSignatures: [String: String] = [:]
         private var roomWidth: Float = 18
         private var roomDepth: Float = 14
+        private var departmentCenters: [String: SCNVector3] = [:]
+        private var departmentRoots: [String: SCNNode] = [:]
+        private var departmentFootprints: [String: DepartmentFootprint] = [:]
         private var currentSelectedID: String?
+        private var currentSelectedProjectID: String?
         private var lastCameraAspect: Float?
-        private var cameraZoom: CGFloat = 9
+        private var cameraZoom: CGFloat = 30
         private var firstPersonFieldOfView: CGFloat = 68
         private var cameraYaw: Float = 0
-        private var cameraPitch: Float = .pi / 4
+        private var cameraPitch: Float = 0.94
         private var firstPersonYaw: Float = 0
         private var firstPersonPitch: Float = -0.08
-        private var isFirstPerson = false
-        private let cameraDistance: Float = 10
+        var cameraMode: CameraMode = .overview
+        var reduceMotion = false
+        private var isFirstPerson: Bool { cameraMode == .firstPerson }
+        private var cameraDistance: Float = 26
         private var stationApproaches: [String: SCNVector3] = [:]
         private var playerRoot: SCNNode?
         private var playerAvatar: SCNNode?
@@ -136,12 +166,16 @@ struct Office3DView: NSViewRepresentable {
         private var movementTimer: Timer?
         private var lastTriggeredSessionID: String?
 
-        func synchronize(_ sessions: [CodexSession], selectedID: String?) {
+        func synchronize(_ groups: [ProjectGroup], selectedID: String?, selectedProjectID: String?) {
+            latestGroups = Dictionary(uniqueKeysWithValues: groups.map { ($0.id, $0) })
+            let sessions = groups.flatMap(\.sessions)
             latestSessions = Dictionary(uniqueKeysWithValues: sessions.map { ($0.id, $0) })
-            let nextSignature = sessions.map { "\($0.id)|\($0.displayName)|\($0.project)" }.joined(separator: "\n")
+            let nextSignature = groups.map { group in
+                "\(group.id)|\(group.project.name)|\(group.project.colorHex)|" + group.sessions.map { "\($0.id)|\($0.displayName)|\($0.state.rawValue)" }.joined(separator: ",")
+            }.joined(separator: "\n")
             if signature != nextSignature {
                 signature = nextSignature
-                render(sessions)
+                render(groups)
             } else {
                 for session in sessions where renderedStates[session.id] != session.state {
                     transition(session, animated: true)
@@ -149,23 +183,22 @@ struct Office3DView: NSViewRepresentable {
             }
             updateActivityBoards(sessions)
             setSelected(selectedID)
+            setSelectedProject(selectedProjectID)
         }
 
-        private func render(_ sessions: [CodexSession]) {
+        private func render(_ groups: [ProjectGroup]) {
             guard let view else { return }
+            let sessions = groups.flatMap(\.sessions)
             let previousPlayerPosition = playerRoot == nil ? nil : playerPosition
-
-            let aspect = max(Double(view.bounds.width / max(view.bounds.height, 1)), 0.7)
-            let count = max(sessions.count, 1)
-            let stationColumns = min(count, max(1, Int(ceil(sqrt(Double(count) * aspect)))))
-            let stationRows = max(1, Int(ceil(Double(count) / Double(stationColumns))))
-            let tileSize: Float = 5
-            // Give the room generous open margins even when there are only a few sessions.
-            // Sessions stay on alternating 5×5 cells, with one empty cell between them.
-            let gridColumns = max(stationColumns * 2 - 1 + 8, 15)
-            let gridRows = max(stationRows * 2 - 1 + 8, 15)
-            roomWidth = Float(gridColumns) * tileSize
-            roomDepth = Float(gridRows) * tileSize
+            let footprints = OfficeSceneBuilder.layout(for: groups)
+            departmentFootprints = footprints
+            let width = footprints.values.map { abs($0.center.x) + $0.width / 2 }.max() ?? 16
+            let depth = footprints.values.map { abs($0.center.z) + $0.depth / 2 }.max() ?? 16
+            roomWidth = Float(max(20, width * 2 + 8))
+            roomDepth = Float(max(20, depth * 2 + 8))
+            let tileSize: Float = 6
+            let gridColumns = max(3, Int(ceil(roomWidth / tileSize)))
+            let gridRows = max(3, Int(ceil(roomDepth / tileSize)))
 
             let scene = SCNScene()
             scene.background.contents = NSColor(hex: 0x1C2030)
@@ -173,6 +206,8 @@ struct Office3DView: NSViewRepresentable {
             sessionRoots.removeAll(keepingCapacity: true)
             selectionRings.removeAll(keepingCapacity: true)
             stationApproaches.removeAll(keepingCapacity: true)
+            departmentCenters.removeAll(keepingCapacity: true)
+            departmentRoots.removeAll(keepingCapacity: true)
             boardContentSignatures.removeAll(keepingCapacity: true)
             renderedStates = Dictionary(uniqueKeysWithValues: sessions.map { ($0.id, $0.state) })
 
@@ -181,21 +216,29 @@ struct Office3DView: NSViewRepresentable {
 
             let stableIDs = sessions.map(\.id).sorted()
             let styleIndices = Dictionary(uniqueKeysWithValues: stableIDs.enumerated().map { ($0.element, $0.offset) })
-            for (index, session) in sessions.enumerated() {
-                let column = index % stationColumns
-                let row = index / stationColumns
-                // Occupied station tiles alternate with an empty 5×5 tile.
-                let x = (Float(column * 2) - Float(stationColumns - 1)) * tileSize
-                let z = (Float(row * 2) - Float(stationRows - 1)) * tileSize
-                let style = AvatarStyle(index: styleIndices[session.id] ?? index)
-                let root = makeAgent(for: session, style: style)
-                root.name = "session:\(session.id)"
-                root.position = SCNVector3(x, 0, z)
-                scene.rootNode.addChildNode(root)
-                sessionRoots[session.id] = root
-                stationApproaches[session.id] = SCNVector3(x, 0, z + 3.2)
-                let planterSide: Float = index.isMultiple(of: 2) ? 1 : -1
-                addPlant(at: SCNVector3(x + planterSide * 2.1, 0, z + 0.85), to: scene)
+            for group in groups {
+                guard let footprint = footprints[group.id] else { continue }
+                let department = DepartmentNodeBuilder.build(project: group.project, footprint: footprint)
+                scene.rootNode.addChildNode(department)
+                departmentRoots[group.id] = department
+                let center = SCNVector3(Float(footprint.center.x), 0, Float(footprint.center.z))
+                departmentCenters[group.id] = center
+                for session in group.sessions {
+                    guard let local = StationNodeBuilder.position(sessionID: session.id, in: footprint) else { continue }
+                    let x = center.x + CGFloat(local.x)
+                    let z = center.z + CGFloat(local.z)
+                    let style = AvatarStyle(index: styleIndices[session.id] ?? 0, salt: group.id)
+                    let root = makeAgent(for: session, style: style)
+                    root.name = "session:\(session.id)"
+                    root.position = SCNVector3(x, 0, z)
+                    scene.rootNode.addChildNode(root)
+                    sessionRoots[session.id] = root
+                    stationApproaches[session.id] = SCNVector3(x, 0, z + 3.2)
+                    addPlant(at: SCNVector3(x + 2.5, 0, z + 1.7), to: scene)
+                }
+                if group.sessions.contains(where: AttentionZoneBuilder.contains) {
+                    addAttentionMarker(for: group, footprint: footprint, to: department)
+                }
             }
 
             if let previousPlayerPosition {
@@ -205,8 +248,7 @@ struct Office3DView: NSViewRepresentable {
                     min(max(Float(previousPlayerPosition.z), -roomDepth / 2 + 1), roomDepth / 2 - 1)
                 )
             } else {
-                let lastStationRowZ = Float(stationRows - 1) * tileSize
-                playerPosition = SCNVector3(0, 0, lastStationRowZ + tileSize * 2)
+                playerPosition = SCNVector3(0, 0, Float(depth) + tileSize)
             }
             let player = SCNNode()
             player.name = "local.player"
@@ -230,6 +272,10 @@ struct Office3DView: NSViewRepresentable {
             scene.rootNode.addChildNode(cameraNode)
             view.pointOfView = cameraNode
             view.isFirstPersonCamera = isFirstPerson
+            if cameraMode == .overview {
+                let maximumDimension = max(Double(roomWidth), Double(roomDepth))
+                cameraZoom = OfficeCameraFraming.overviewScale(forMaximumDimension: maximumDimension)
+            }
             lastCameraAspect = nil
             updateCameraFraming()
         }
@@ -249,9 +295,33 @@ struct Office3DView: NSViewRepresentable {
         }
 
         func toggleCameraMode() {
-            guard let cameraNode = view?.pointOfView, let camera = cameraNode.camera else { return }
-            isFirstPerson.toggle()
-            view?.isFirstPersonCamera = isFirstPerson
+            setCameraMode(isFirstPerson ? .overview : .firstPerson)
+        }
+
+        func setCameraMode(_ mode: CameraMode, animated: Bool = true) {
+            guard let cameraNode = view?.pointOfView, let camera = cameraNode.camera else {
+                cameraMode = mode
+                return
+            }
+            cameraMode = mode
+            switch mode {
+            case .overview:
+                cameraPitch = 0.94
+                cameraDistance = 26
+                cameraZoom = OfficeCameraFraming.overviewScale(forMaximumDimension: max(Double(roomWidth), Double(roomDepth)))
+            case .orbit:
+                cameraPitch = 0.72
+                cameraDistance = 17
+                cameraZoom = OfficeCameraFraming.clampedScale(16)
+            case .firstPerson:
+                cameraDistance = 3
+            }
+            let focus = cameraFocusPosition
+            if animated {
+                SCNTransaction.begin()
+                SCNTransaction.animationDuration = OfficeMotionPolicy.transitionDuration(reduceMotion: reduceMotion)
+                SCNTransaction.animationTimingFunction = CAMediaTimingFunction(name: .easeOut)
+            }
             camera.usesOrthographicProjection = !isFirstPerson
             if isFirstPerson {
                 camera.fieldOfView = firstPersonFieldOfView
@@ -264,8 +334,10 @@ struct Office3DView: NSViewRepresentable {
                 view?.scene?.rootNode.childNode(withName: "local.player", recursively: false)?
                     .childNode(withName: "player.nameplate", recursively: false)?.isHidden = false
             }
+            view?.isFirstPersonCamera = isFirstPerson
             view?.setPointerCaptured(isFirstPerson || !pressedKeys.isEmpty)
-            positionCamera(cameraNode, focus: playerPosition)
+            positionCamera(cameraNode, focus: focus)
+            if animated { SCNTransaction.commit() }
         }
 
         func zoomCamera(by amount: CGFloat) {
@@ -274,7 +346,7 @@ struct Office3DView: NSViewRepresentable {
                 firstPersonFieldOfView = min(max(firstPersonFieldOfView - amount * 4, 35), 100)
                 camera.fieldOfView = firstPersonFieldOfView
             } else {
-                cameraZoom = min(max(cameraZoom * CGFloat(pow(0.9, Double(amount))), 7), 28)
+                cameraZoom = OfficeCameraFraming.clampedScale(cameraZoom * CGFloat(pow(0.9, Double(amount))))
                 camera.orthographicScale = cameraZoom
             }
         }
@@ -288,7 +360,13 @@ struct Office3DView: NSViewRepresentable {
                 cameraYaw -= Float(deltaX) * 0.004
                 cameraPitch = min(max(cameraPitch + Float(deltaY) * 0.004, 0.15), 1.35)
             }
-            if let cameraNode = view?.pointOfView { positionCamera(cameraNode, focus: playerPosition) }
+            if let cameraNode = view?.pointOfView { positionCamera(cameraNode, focus: cameraFocusPosition) }
+        }
+
+        private var cameraFocusPosition: SCNVector3 {
+            if let selectedProjectID = currentSelectedProjectID, let center = departmentCenters[selectedProjectID] { return center }
+            if let currentSelectedID, let root = sessionRoots[currentSelectedID] { return root.position }
+            return SCNVector3Zero
         }
 
         private func positionCamera(_ cameraNode: SCNNode, focus: SCNVector3) {
@@ -316,6 +394,21 @@ struct Office3DView: NSViewRepresentable {
             for (sessionID, ring) in selectionRings {
                 ring.isHidden = sessionID != id
             }
+        }
+
+        private func setSelectedProject(_ id: String?) {
+            guard currentSelectedProjectID != id else { return }
+            currentSelectedProjectID = id
+            for (projectID, node) in departmentRoots {
+                node.opacity = projectID == id ? 1 : 0.84
+            }
+            guard id != nil, let camera = view?.pointOfView else { return }
+            if cameraMode == .overview { setCameraMode(.orbit) }
+            SCNTransaction.begin()
+            SCNTransaction.animationDuration = OfficeMotionPolicy.transitionDuration(reduceMotion: reduceMotion)
+            SCNTransaction.animationTimingFunction = CAMediaTimingFunction(name: .easeOut)
+            positionCamera(camera, focus: cameraFocusPosition)
+            SCNTransaction.commit()
         }
 
         func setMovementKey(_ keyCode: UInt16, isPressed: Bool) {
@@ -475,8 +568,41 @@ struct Office3DView: NSViewRepresentable {
                     if let session = latestSessions[id] { onSelect?(session) }
                     return
                 }
+                if let name = current.name, name.hasPrefix("department:") {
+                    let id = String(name.dropFirst("department:".count))
+                    if let group = latestGroups[id] { onSelectProject?(group.project) }
+                    return
+                }
                 node = current.parent
             }
+        }
+
+        @objc func didDoubleClick(_ recognizer: NSClickGestureRecognizer) {
+            guard let view, recognizer.state == .ended else { return }
+            let point = recognizer.location(in: view)
+            let hits = view.hitTest(point, options: [.searchMode: SCNHitTestSearchMode.closest.rawValue])
+            var node = hits.first?.node
+            while let current = node {
+                if let name = current.name, name.hasPrefix("session:") {
+                    let id = String(name.dropFirst("session:".count))
+                    if let session = latestSessions[id] { onOpen?(session) }
+                    return
+                }
+                node = current.parent
+            }
+        }
+
+        private func addAttentionMarker(for group: ProjectGroup, footprint: DepartmentFootprint, to department: SCNNode) {
+            let plate = SCNText(string: "ATENÇÃO · \(group.attentionCount)", extrusionDepth: 0.015)
+            plate.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .bold)
+            plate.firstMaterial = material(0xFF7A68, emission: 0xFF7A68)
+            let node = SCNNode(geometry: plate)
+            node.name = "department.attention"
+            node.scale = SCNVector3(0.035, 0.035, 0.035)
+            node.position = SCNVector3(0, 1.2, Float(footprint.depth / 2) - 0.55)
+            node.constraints = [SCNBillboardConstraint()]
+            node.renderingOrder = 130
+            department.addChildNode(node)
         }
 
         private func addLights(to scene: SCNScene) {
@@ -1136,6 +1262,7 @@ final class OfficeSceneView: SCNView {
     var onZoom: ((CGFloat) -> Void)?
     var onOrbit: ((CGFloat, CGFloat) -> Void)?
     var onToggleCamera: (() -> Void)?
+    var onCameraMode: ((CameraMode) -> Void)?
     var isFirstPersonCamera = false {
         didSet {
             previousLookPoint = window.map { convert($0.convertPoint(fromScreen: NSEvent.mouseLocation), from: nil) }

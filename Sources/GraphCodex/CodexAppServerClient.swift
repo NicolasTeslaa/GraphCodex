@@ -30,6 +30,7 @@ final class CodexAppServerClient: @unchecked Sendable {
     private var bufferedOutput = Data()
     private var nextRequestID = 1
     private var initialized = false
+    var onServerNotice: (@Sendable (String) -> Void)?
 
     func loadSessions(inactivityMinutes: Double) async throws -> [CodexSession] {
         try await withCheckedThrowingContinuation { continuation in
@@ -104,7 +105,7 @@ final class CodexAppServerClient: @unchecked Sendable {
         self.bufferedOutput = Data()
         self.initialized = false
 
-        let response = try request(method: "initialize", params: [
+        let response = try requestSync(method: "initialize", params: [
             "clientInfo": ["name": "GraphCodex", "title": "GraphCodex", "version": "0.1.0"],
             "capabilities": ["experimentalApi": true]
         ])
@@ -114,20 +115,12 @@ final class CodexAppServerClient: @unchecked Sendable {
     }
 
     private static func findCodexExecutable() throws -> String {
-        var candidates: [String] = []
+        var resourcesPath: String?
         if let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.openai.codex"),
            let resources = Bundle(url: appURL)?.resourceURL {
-            candidates.append(resources.appendingPathComponent("codex").path)
+            resourcesPath = resources.path
         }
-        candidates += [
-            "/Applications/ChatGPT.app/Contents/Resources/codex",
-            "/opt/homebrew/bin/codex",
-            "/usr/local/bin/codex"
-        ]
-        if let path = ProcessInfo.processInfo.environment["PATH"] {
-            candidates += path.split(separator: ":").map { String($0) + "/codex" }
-        }
-        guard let found = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else {
+        guard let found = CodexExecutableLocator.locate(appResourcesPath: resourcesPath) else {
             throw CodexConnectionError.executableNotFound
         }
         return found
@@ -144,7 +137,7 @@ final class CodexAppServerClient: @unchecked Sendable {
                 "sortDirection": "desc"
             ]
             if let cursor { params["cursor"] = cursor }
-            let response = try request(method: "thread/list", params: params)
+            let response = try requestSync(method: "thread/list", params: params)
             guard let result = response["result"] as? [String: Any],
                   let data = result["data"] as? [[String: Any]] else {
                 throw Self.rpcError(from: response)
@@ -156,7 +149,7 @@ final class CodexAppServerClient: @unchecked Sendable {
     }
 
     private func latestTurn(threadID: String) throws -> TurnSummary? {
-        let response = try request(method: "thread/turns/list", params: [
+        let response = try requestSync(method: "thread/turns/list", params: [
             "threadId": threadID,
             "limit": 1,
             "sortDirection": "desc",
@@ -222,13 +215,18 @@ final class CodexAppServerClient: @unchecked Sendable {
         return (.unknown, "O Codex ainda não informou o estado desta sessão")
     }
 
-    private func request(method: String, params: [String: Any]) throws -> [String: Any] {
+    fileprivate func requestSync(method: String, params: [String: Any]) throws -> [String: Any] {
         let id = nextRequestID
         nextRequestID += 1
         try write(["id": id, "method": method, "params": params])
         while true {
             guard let data = try readLine().data(using: .utf8),
                   let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
+            if let handled = CodexServerRequestRouter.response(for: object) {
+                try write(handled.response)
+                if let notice = handled.notice { onServerNotice?(notice) }
+                continue
+            }
             if (object["id"] as? Int) == id { return object }
         }
     }
@@ -264,6 +262,25 @@ final class CodexAppServerClient: @unchecked Sendable {
     }
 
     deinit { process?.terminate() }
+}
+
+extension CodexAppServerClient: CodexTransport {
+    func request(method: String, params: [String: Any]) async throws -> [String: Any] {
+        try await withCheckedThrowingContinuation { continuation in
+            queue.async {
+                do {
+                    try self.connectIfNeeded()
+                    let response = try self.requestSync(method: method, params: params)
+                    guard let result = response["result"] as? [String: Any] else {
+                        throw Self.rpcError(from: response)
+                    }
+                    continuation.resume(returning: result)
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
 }
 
 private struct ThreadRecord {

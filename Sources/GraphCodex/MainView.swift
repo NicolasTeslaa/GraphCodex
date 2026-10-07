@@ -1,253 +1,243 @@
+import AppKit
 import SwiftUI
-
-private enum Palette {
-    static let ink = Color(hex: 0x111420)
-    static let panel = Color(hex: 0x1B2030)
-    static let raised = Color(hex: 0x252B3E)
-    static let muted = Color(hex: 0x929CB4)
-    static let line = Color(hex: 0x333B50)
-    static let lilac = Color(hex: 0xB2A3FF)
-    static let mint = Color(hex: 0x73E1B5)
-    static let coral = Color(hex: 0xFF7A68)
-    static let gold = Color(hex: 0xF4C86A)
-}
 
 struct MainView: View {
     @ObservedObject var monitor: CodexMonitor
-    @State private var filter: SessionFilter = .current
     @State private var searchText = ""
+    @State private var stateFilter: SessionFilter = .all
+    @State private var showingNewAgent = false
+    @State private var showingNewProject = false
+    @State private var duplicateSource: CodexSession?
+    @State private var cameraMode: CameraMode = .overview
 
-    private var visibleSessions: [CodexSession] {
-        monitor.sessions
-            .filter(filter.includes)
-            .filter { searchText.isEmpty || $0.displayName.localizedCaseInsensitiveContains(searchText) || $0.project.localizedCaseInsensitiveContains(searchText) }
-            .sorted {
-                if $0.state == .attention && $1.state != .attention { return true }
-                if $1.state == .attention && $0.state != .attention { return false }
-                return $0.updatedAt > $1.updatedAt
+    private var groups: [ProjectGroup] {
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        return monitor.projectGroups.compactMap { group in
+            let sessions = group.sessions.filter { session in
+                let matchesState = stateFilter.includes(session)
+                let matchesQuery = query.isEmpty || [session.displayName, session.cwd, session.project,
+                                                       session.promptSummary ?? "", group.project.name,
+                                                       group.project.tags.joined(separator: " ")]
+                    .joined(separator: " ").localizedCaseInsensitiveContains(query)
+                return matchesState && matchesQuery
             }
+            guard query.isEmpty || !sessions.isEmpty || group.sessions.isEmpty else { return nil }
+            return ProjectGroup(project: group.project, sessions: sessions)
+        }
     }
+
+    private var attentionSessions: [CodexSession] {
+        monitor.sessions.filter { $0.state == .attention }
+            .filter { sessionFilterMatchesSearch(session: $0) }
+    }
+
+    private var focusedGroup: ProjectGroup? { groups.first { $0.id == monitor.selectedProjectID } }
 
     var body: some View {
         VStack(spacing: 0) {
             topBar
-            Rectangle().fill(Palette.line.opacity(0.65)).frame(height: 1)
-
-            if let error = monitor.connectionError {
-                connectionBanner(error)
+            if let error = monitor.connectionError { notice(error, color: GraphCodexTheme.attention) }
+            if let integrationNotice = monitor.integrationNotice { notice(integrationNotice, color: GraphCodexTheme.quiet) }
+            HStack(spacing: 0) {
+                ProjectSidebar(groups: groups, attentionSessions: attentionSessions,
+                               selectedProjectID: monitor.selectedProjectID,
+                               onSelectProject: { monitor.focus(project: $0) },
+                               onSelectSession: monitor.select)
+                    .frame(width: 224)
+                Rectangle().fill(GraphCodexTheme.line).frame(width: 1)
+                workspace
+                if let session = monitor.selectedSession {
+                    Rectangle().fill(GraphCodexTheme.line).frame(width: 1)
+                    SessionInspector(monitor: monitor, session: session) { duplicateSource = $0; showingNewAgent = true }
+                        .frame(width: 292)
+                }
             }
-
-            worldPanel
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-
             bottomBar
         }
-        .background(Palette.ink)
-        .foregroundStyle(.white)
+        .background(GraphCodexTheme.background)
+        .foregroundStyle(GraphCodexTheme.text)
+        .sheet(isPresented: $showingNewAgent, onDismiss: { duplicateSource = nil }) {
+            NewAgentFlow(monitor: monitor, initialSession: duplicateSource,
+                         initialProjectID: duplicateSource == nil ? monitor.selectedProjectID : nil)
+        }
+        .sheet(isPresented: $showingNewProject) {
+            ProjectEditor { project in
+                do { try monitor.saveProject(project) }
+                catch { monitor.report(error) }
+            }
+        }
+        .onChange(of: monitor.officeMode) { _, mode in monitor.updateDefaultMode(mode) }
     }
 
     private var topBar: some View {
-        HStack(spacing: 14) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 9).fill(Color(hex: 0x786CDB)).frame(width: 38, height: 38)
-                PixelMark().fill(Color(hex: 0xF7F0FF)).frame(width: 24, height: 24)
-            }
-            VStack(alignment: .leading, spacing: 1) {
-                Text("GraphCodex").font(.system(size: 17, weight: .bold, design: .rounded))
-                Text("sua oficina de agentes").font(.system(size: 10, weight: .medium, design: .monospaced)).foregroundStyle(Palette.muted)
-            }
-
-            Spacer()
-
-            HStack(spacing: 7) {
-                CounterChip(value: monitor.currentCount, label: "NO MAPA", color: Palette.lilac)
-                CounterChip(value: monitor.workingCount, label: "ATIVAS", color: Palette.mint)
-                CounterChip(value: monitor.attentionCount, label: "ATENÇÃO", color: Palette.coral)
-            }
-
-            Spacer()
-
-            Button {
-                Task { await monitor.refresh() }
-            } label: {
-                Image(systemName: "arrow.clockwise")
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(Palette.muted)
-                    .frame(width: 34, height: 34)
-                    .background(Palette.panel, in: RoundedRectangle(cornerRadius: 9))
-            }
-            .buttonStyle(.plain)
-            .help("Atualizar sessões")
-
-            SettingsLink {
-                Image(systemName: "slider.horizontal.3")
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(Palette.muted)
-                    .frame(width: 34, height: 34)
-                    .background(Palette.panel, in: RoundedRectangle(cornerRadius: 9))
-            }
-            .buttonStyle(.plain)
-            .help("Preferências")
-        }
-        .padding(.horizontal, 20)
-        .padding(.vertical, 13)
-        .background(Color(hex: 0x171B28))
-    }
-
-    private var worldPanel: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack(spacing: 9) {
-                HStack(spacing: 8) {
-                    Image(systemName: "magnifyingglass").foregroundStyle(Palette.muted)
-                    TextField("Buscar projeto ou sessão", text: $searchText)
-                        .textFieldStyle(.plain)
-                        .font(.system(size: 12, weight: .medium))
+        VStack(spacing: 12) {
+            HStack(spacing: 13) {
+                Image(systemName: "square.3.layers.3d.fill").font(.system(size: 19, weight: .semibold))
+                    .foregroundStyle(GraphCodexTheme.primary)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("GraphCodex").font(.system(size: 17, weight: .bold, design: .rounded))
+                    Text("ESCRITÓRIO OPERACIONAL").font(.system(size: 8, weight: .bold, design: .monospaced)).tracking(1)
+                        .foregroundStyle(GraphCodexTheme.muted)
                 }
-                .padding(.horizontal, 11).frame(height: 34)
-                .background(Palette.panel, in: RoundedRectangle(cornerRadius: 9))
-
-                Picker("Filtro", selection: $filter) {
-                    ForEach(SessionFilter.allCases) { option in Text(option.rawValue).tag(option) }
+                Rectangle().fill(GraphCodexTheme.line).frame(width: 1, height: 28).padding(.horizontal, 3)
+                metric("AGENTS", value: monitor.sessions.count, tint: GraphCodexTheme.text)
+                metric("ATIVOS", value: monitor.workingCount, tint: GraphCodexTheme.working)
+                metric("ATENÇÃO", value: monitor.attentionCount, tint: GraphCodexTheme.attention)
+                metric("CONCLUÍDOS", value: monitor.completedCount, tint: GraphCodexTheme.primary)
+                Spacer(minLength: 4)
+                Button { showingNewProject = true } label: { Label("Departamento", systemImage: "plus") }
+                    .buttonStyle(.bordered).controlSize(.small)
+                Button { showingNewAgent = true } label: { Label("Novo Agent", systemImage: "person.badge.plus") }
+                    .buttonStyle(.borderedProminent).tint(GraphCodexTheme.primary).controlSize(.small)
+                Button { Task { await monitor.refresh() } } label: {
+                    Image(systemName: monitor.isRefreshing ? "arrow.triangle.2.circlepath" : "arrow.clockwise")
                 }
-                .pickerStyle(.segmented)
-                .frame(width: 320)
-
+                .buttonStyle(.bordered).controlSize(.small).help("Atualizar sessões")
+                SettingsLink { Image(systemName: "slider.horizontal.3") }
+                    .buttonStyle(.bordered).controlSize(.small).help("Ajustes")
+            }
+            HStack(spacing: 10) {
                 HStack(spacing: 7) {
-                    Image(systemName: monitor.isRefreshing ? "arrow.triangle.2.circlepath" : "circle.fill")
-                        .font(.system(size: 8, weight: .bold))
-                        .foregroundStyle(monitor.connectionError == nil ? Palette.mint : Palette.coral)
-                    Text(monitor.connectionError == nil ? "AO VIVO" : "SEM CONEXÃO")
-                        .font(.system(size: 9, weight: .bold, design: .monospaced))
-                        .tracking(1)
-                        .foregroundStyle(monitor.connectionError == nil ? Palette.mint : Palette.coral)
+                    Image(systemName: "magnifyingglass").foregroundStyle(GraphCodexTheme.muted)
+                    TextField("Buscar agents, pastas ou departamentos", text: $searchText)
+                        .textFieldStyle(.plain).font(.system(size: 11))
                 }
-                .padding(.horizontal, 10).padding(.vertical, 7)
-                .background(Palette.panel, in: Capsule())
+                .padding(.horizontal, 9).frame(width: 270, height: 28)
+                .background(GraphCodexTheme.raised, in: RoundedRectangle(cornerRadius: 7))
+                Picker("Status", selection: $stateFilter) {
+                    ForEach(SessionFilter.allCases) { Text($0.rawValue).tag($0) }
+                }
+                .labelsHidden().frame(width: 132).controlSize(.small)
+                Spacer()
+                if monitor.officeMode == .map {
+                    Picker("Câmera", selection: $cameraMode) {
+                        ForEach(CameraMode.allCases) { Text($0.title).tag($0) }
+                    }
+                    .pickerStyle(.segmented).frame(width: 242).controlSize(.small)
+                }
+                Picker("Visualização", selection: $monitor.officeMode) {
+                    ForEach(OfficeMode.allCases) { mode in Label(mode.title, systemImage: mode.symbol).tag(mode) }
+                }
+                .pickerStyle(.segmented).frame(width: 238).controlSize(.small)
             }
-
-            ZStack {
-                Office3DView(
-                    sessions: Array(visibleSessions.prefix(120)),
-                    selectedSessionID: monitor.selectedSessionID,
-                    onSelect: monitor.open
-                )
-                if visibleSessions.isEmpty {
-                    emptyState
-                        .padding(20)
-                        .background(Color(hex: 0x171B28).opacity(0.86), in: RoundedRectangle(cornerRadius: 14))
-                        .allowsHitTesting(false)
-                }
-                HStack(spacing: 6) {
-                    Image(systemName: "rotate.3d").foregroundStyle(Palette.lilac)
-                    Text("WASD / SETAS: ANDAR · MOUSE PRESO ENQUANTO ANDA · V: 1ª PESSOA · MOUSE: OLHAR · SCROLL: ZOOM · GRADE 5×5")
-                        .foregroundStyle(Palette.muted)
-                }
-                .font(.system(size: 8, weight: .bold, design: .monospaced))
-                .padding(.horizontal, 10).padding(.vertical, 8)
-                .background(Color(hex: 0x171B28).opacity(0.82), in: Capsule())
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-                .padding(12)
-                .allowsHitTesting(false)
-            }
-            .clipShape(RoundedRectangle(cornerRadius: 15))
-            .overlay(RoundedRectangle(cornerRadius: 15).stroke(Palette.line, lineWidth: 1))
         }
-        .padding(16)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .padding(.horizontal, 16).padding(.vertical, 11)
+        .background(GraphCodexTheme.surface)
+        .overlay(alignment: .bottom) { Rectangle().fill(GraphCodexTheme.line).frame(height: 1) }
     }
 
-    private var emptyState: some View {
-        VStack(spacing: 10) {
-            Text("▧   ▧   ▧").font(.system(size: 32, weight: .black, design: .monospaced)).foregroundStyle(Palette.lilac.opacity(0.8))
-            Text(monitor.connectionError == nil ? "A oficina está tranquila" : "Conectando ao Codex…")
-                .font(.system(size: 16, weight: .bold, design: .rounded))
-            Text(monitor.connectionError == nil ? "As sessões recentes vão aparecer aqui." : "O GraphCodex está buscando suas sessões locais.")
-                .font(.system(size: 12)).foregroundStyle(Palette.muted)
+    @ViewBuilder private var workspace: some View {
+        switch monitor.officeMode {
+        case .map:
+            ZStack(alignment: .bottomTrailing) {
+                Office3DView(groups: Array(groups.prefix(120)), selectedSessionID: monitor.selectedSessionID,
+                             selectedProjectID: monitor.selectedProjectID, cameraMode: cameraMode,
+                             reduceMotion: monitor.reduceMotion,
+                             onSelect: monitor.select, onOpen: monitor.open,
+                             onSelectProject: { monitor.selectedProjectID = $0.id })
+                    .accessibilityLabel("Mapa tridimensional do escritório")
+                VStack(alignment: .trailing, spacing: 10) {
+                    MiniMapView(groups: groups, selectedProjectID: monitor.selectedProjectID) {
+                        monitor.selectedProjectID = $0.id
+                    }
+                    Label("Clique seleciona · Enter abre no Codex", systemImage: "cursorarrow.click")
+                        .font(.system(size: 9)).foregroundStyle(GraphCodexTheme.muted)
+                        .padding(.horizontal, 9).padding(.vertical, 6)
+                        .background(GraphCodexTheme.background.opacity(0.9), in: Capsule())
+                }
+                .padding(14)
+            }
+        case .list:
+            SessionListView(groups: groups, selectedSessionID: monitor.selectedSessionID,
+                            metadata: monitor.metadata(for:), onSelect: monitor.select, onOpen: monitor.open)
+        case .focus:
+            ProjectFocusView(group: focusedGroup, selectedSessionID: monitor.selectedSessionID,
+                             metadata: monitor.metadata(for:), onSelect: monitor.select,
+                             onOpen: monitor.open) { project in
+                monitor.selectedProjectID = project?.id
+                showingNewAgent = true
+            }
         }
-    }
-
-    private func connectionBanner(_ error: String) -> some View {
-        HStack(spacing: 9) {
-            Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(Palette.gold)
-            Text(error).font(.system(size: 11)).foregroundStyle(.white.opacity(0.9))
-            Spacer()
-            Button("Tentar de novo") { Task { await monitor.refresh() } }
-                .font(.system(size: 10, weight: .bold)).buttonStyle(.plain).foregroundStyle(Palette.lilac)
-        }
-        .padding(.horizontal, 20).padding(.vertical, 9)
-        .background(Color(hex: 0x392A2A))
     }
 
     private var bottomBar: some View {
         HStack(spacing: 8) {
-            Image(systemName: "lock.fill").font(.system(size: 9)).foregroundStyle(Palette.mint)
-            Text("DADOS LOCAIS · SOMENTE LEITURA")
-                .font(.system(size: 9, weight: .bold, design: .monospaced)).tracking(0.8).foregroundStyle(Palette.muted)
+            Circle().fill(monitor.connectionError == nil ? GraphCodexTheme.working : GraphCodexTheme.attention).frame(width: 6, height: 6)
+            Text(monitor.connectionError == nil ? "App-server local" : "Conexão indisponível")
+            Text("·").foregroundStyle(GraphCodexTheme.muted)
+            Text(monitor.lastUpdated.map { "Atualizado \($0.formatted(date: .omitted, time: .standard))" } ?? "Aguardando dados")
             Spacer()
-            Text(monitor.lastUpdated.map { "Atualizado às \($0.formatted(date: .omitted, time: .shortened))" } ?? "Aguardando primeira leitura")
-                .font(.system(size: 9, design: .monospaced)).foregroundStyle(Palette.muted)
+            Text("Aprovações e permissões são controladas pelo Codex")
         }
-        .padding(.horizontal, 20).padding(.vertical, 9)
-        .background(Color(hex: 0x171B28))
+        .font(.system(size: 9, design: .monospaced)).foregroundStyle(GraphCodexTheme.muted)
+        .padding(.horizontal, 14).padding(.vertical, 7).background(GraphCodexTheme.surface)
+        .overlay(alignment: .top) { Rectangle().fill(GraphCodexTheme.line).frame(height: 1) }
     }
-}
 
-private struct CounterChip: View {
-    let value: Int
-    let label: String
-    let color: Color
-    var body: some View {
-        HStack(spacing: 7) {
-            Text("\(value)").font(.system(size: 13, weight: .heavy, design: .monospaced)).foregroundStyle(color)
-            Text(label).font(.system(size: 8, weight: .bold, design: .monospaced)).tracking(0.7).foregroundStyle(Palette.muted)
+    private func metric(_ title: String, value: Int, tint: Color) -> some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text("\(value)").font(.system(size: 14, weight: .bold, design: .rounded).monospacedDigit()).foregroundStyle(tint)
+            Text(title).font(.system(size: 8, weight: .bold, design: .monospaced)).foregroundStyle(GraphCodexTheme.muted)
         }
-        .padding(.horizontal, 10).padding(.vertical, 7)
-        .background(Palette.panel, in: RoundedRectangle(cornerRadius: 8))
+        .frame(minWidth: 44, alignment: .leading)
     }
-}
 
-private struct PixelMark: Shape {
-    func path(in rect: CGRect) -> Path {
-        let unit = rect.width / 5
-        let cells: [(Int, Int)] = [(1,0),(2,0),(3,0),(0,1),(1,1),(3,1),(4,1),(0,2),(2,2),(4,2),(0,3),(1,3),(3,3),(4,3),(1,4),(2,4),(3,4)]
-        var path = Path()
-        for (x,y) in cells { path.addRect(CGRect(x: rect.minX + CGFloat(x) * unit, y: rect.minY + CGFloat(y) * unit, width: unit - 1, height: unit - 1)) }
-        return path
+    private func notice(_ message: String, color: Color) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(color)
+            Text(message).font(.system(size: 11)).foregroundStyle(GraphCodexTheme.text).lineLimit(3)
+            Spacer()
+            Button { monitor.dismissNotice(message) } label: { Image(systemName: "xmark") }
+                .buttonStyle(.plain).foregroundStyle(GraphCodexTheme.muted)
+        }
+        .padding(.horizontal, 14).padding(.vertical, 8).background(color.opacity(0.1))
+    }
+
+    private func sessionFilterMatchesSearch(session: CodexSession) -> Bool {
+        searchText.isEmpty || [session.displayName, session.cwd, session.project, session.promptSummary ?? ""]
+            .joined(separator: " ").localizedCaseInsensitiveContains(searchText)
     }
 }
 
 struct SettingsView: View {
     @ObservedObject var monitor: CodexMonitor
-    var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            Text("Preferências").font(.system(size: 22, weight: .bold, design: .rounded))
-            VStack(alignment: .leading, spacing: 7) {
-                HStack { Text("Atualização"); Spacer(); Text("a cada \(Int(monitor.refreshInterval)) s").foregroundStyle(Palette.muted) }
-                Slider(value: Binding(get: { monitor.refreshInterval }, set: monitor.updateRefreshInterval), in: 5...30, step: 5)
-            }
-            VStack(alignment: .leading, spacing: 7) {
-                HStack { Text("Aviso de inatividade"); Spacer(); Text("\(Int(monitor.inactivityMinutes)) min").foregroundStyle(Palette.muted) }
-                Slider(value: Binding(get: { monitor.inactivityMinutes }, set: monitor.updateInactivityMinutes), in: 1...20, step: 1)
-            }
-            Label("O GraphCodex consulta metadados locais e não grava dados nas sessões.", systemImage: "lock.shield.fill")
-                .font(.system(size: 11)).foregroundStyle(Palette.muted).fixedSize(horizontal: false, vertical: true)
-            Spacer()
-        }
-        .padding(24)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .background(Palette.ink)
-        .foregroundStyle(.white)
-    }
-}
+    @State private var soundEnabled = false
+    @State private var reduceMotion = false
 
-private extension Color {
-    init(hex: UInt32) {
-        self.init(
-            .sRGB,
-            red: Double((hex >> 16) & 0xFF) / 255,
-            green: Double((hex >> 8) & 0xFF) / 255,
-            blue: Double(hex & 0xFF) / 255,
-            opacity: 1
-        )
+    var body: some View {
+        Form {
+            Section("Atualização e atenção") {
+                HStack {
+                    Text("Intervalo de atualização")
+                    Slider(value: Binding(get: { monitor.refreshInterval }, set: monitor.updateRefreshInterval), in: 5...60, step: 1)
+                    Text("\(Int(monitor.refreshInterval)) s").monospacedDigit().frame(width: 40)
+                }
+                HStack {
+                    Text("Considerar inativo após")
+                    Slider(value: Binding(get: { monitor.inactivityMinutes }, set: monitor.updateInactivityMinutes), in: 1...120, step: 1)
+                    Text("\(Int(monitor.inactivityMinutes)) min").monospacedDigit().frame(width: 52)
+                }
+            }
+            Section("Escritório") {
+                Picker("Tela inicial", selection: $monitor.officeMode) {
+                    ForEach(OfficeMode.allCases) { Text($0.title).tag($0) }
+                }
+                Toggle("Som discreto quando surgir atenção", isOn: $soundEnabled)
+                Toggle("Reduzir movimento", isOn: $reduceMotion)
+            }
+            Section {
+                Text("O GraphCodex nunca aprova ações automaticamente. Modelo, sandbox e permissões continuam sob controle do Codex.")
+                    .font(.caption).foregroundStyle(GraphCodexTheme.muted)
+            }
+        }
+        .formStyle(.grouped)
+        .padding(12)
+        .background(GraphCodexTheme.background)
+        .onAppear {
+            soundEnabled = monitor.soundEnabled
+            reduceMotion = monitor.reduceMotion
+        }
+        .onChange(of: soundEnabled) { _, value in monitor.updateSoundEnabled(value) }
+        .onChange(of: reduceMotion) { _, value in monitor.updateReduceMotion(value) }
     }
 }

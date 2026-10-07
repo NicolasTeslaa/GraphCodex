@@ -20,7 +20,33 @@ targets:
     platform: macOS
     sources:
       - path: Sources/GraphCodex
+        includes:
+          - "**/*.swift"
       - path: Sources/GraphCodex/Assets.xcassets
     settings:
       base:
         INFOPLIST_KEY_NSHighResolutionCapable: YES
+  GraphCodexTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: Tests/GraphCodexTests
+    dependencies:
+      - target: GraphCodex
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.graphcodex.tests
+        PRODUCT_MODULE_NAME: GraphCodexTests
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/GraphCodex.app/Contents/MacOS/GraphCodex"
+        BUNDLE_LOADER: "$(TEST_HOST)"
+schemes:
+  GraphCodex:
+    build:
+      targets:
+        GraphCodex: all
+        GraphCodexTests: [test]
+    test:
+      config: Debug
+      targets:
+        - GraphCodexTests
